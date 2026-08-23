@@ -1,0 +1,7 @@
+# Dependencias para desarrollo local y pruebas (unitarias + TestStream).
+# Los contenedores usan los requirements.txt especificos de cada servicio
+# (producer/, beam_pipeline/, consumer/) para mantener las imagenes livianas.
+apache-beam==2.61.0
+jsonschema==4.23.0
+kafka-python==2.2.15
+pytest==8.3.3
