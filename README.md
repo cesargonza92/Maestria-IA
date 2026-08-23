@@ -1,8 +1,6 @@
 # Proyecto Integrador — Data Streaming (Kafka + Apache Beam)
 
-**Maestría en Inteligencia Artificial — FPUNA**
-Materia: *Streaming de datos y sus aplicaciones* · Docente: Rodrigo Parra, M.Sc.
-Integrantes: **Graciela Lezcano** · **César Gonzalez**
+**Maestría en Inteligencia Artificial — FPUNA**                                                                                                                    Materia: *Streaming de datos y sus aplicaciones* · Docente: Rodrigo Parra, M.Sc.                                                                                   Integrantes: **Graciela Lezcano** · **César Gonzalez**
 
 
 Detección de patrones sospechosos en transacciones de pago **sintéticas** (frecuencia, monto acumulado,
@@ -140,6 +138,4 @@ de Java. Para limpiarlo también: `docker compose down -v`.)
 | Integrante | Contribución principal |
 |---|---|
 | Graciela Lezcano ([@graclez](https://github.com/graclez)) | Diseño e implementación completa: contrato de eventos, productor sintético, pipeline de Beam (validación, gate de tardanza, deduplicación, ventanas, reglas), consumidor de demostración, infraestructura Docker, pruebas (unitarias, `TestStream`, e2e) y documentación. |
-| César Gonzalez ([@cesargonza92](https://github.com/cesargonza92)) | *(completar a medida que avance su aporte)* |
-
-Entrega grupal para la materia *Streaming de datos y sus aplicaciones* (Maestría en IA, FPUNA).
+| César Gonzalez ([@cesargonza92](https://github.com/cesargonza92)) | *(completar!!)* |
