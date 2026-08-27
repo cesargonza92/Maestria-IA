@@ -161,3 +161,75 @@ def test_event_beyond_policy_is_dropped_before_reaching_the_window():
             ),
         }
         assert_that(too_late, equal_to([expected_too_late]), label="exactly_one_dropped")
+
+
+def test_a_single_anomalous_future_event_only_advances_the_gate_by_the_capped_skew():
+    """Sin tope de avance, un unico evento con event_time muy adelantado
+    (error de reloj del cliente, dato malicioso) empujaria el maximo visto
+    de la tarjeta al valor anomalo completo, corrompiendo el gate para
+    cualquier evento legitimo posterior -- justamente el tipo de dato
+    adversarial que un sistema antifraude deberia tolerar. Con el tope, el
+    avance de un solo evento queda acotado a `max_future_skew_seconds`; se
+    verifica inspeccionando el atraso reportado en el evento descartado a
+    continuacion, que revela el maximo REALMENTE usado por el gate."""
+    max_future_skew = TooLateGateFn().max_future_skew_seconds
+    test_stream = (
+        TestStream()
+        .advance_watermark_to(0)
+        .add_elements([TimestampedValue(_event(), 0)])
+        .add_elements([TimestampedValue(_event(), 100_000)])  # anomalo
+        .add_elements([TimestampedValue(_event(), 0)])  # revela el maximo realmente capturado
+        .advance_watermark_to_infinity()
+    )
+
+    with TestPipeline() as p:
+        gated = (
+            p
+            | test_stream
+            | "KeyByCardForGate" >> beam.Map(lambda e: (e["key"], e))
+            | "TooLateGate" >> beam.ParDo(TooLateGateFn()).with_outputs(
+                TooLateGateFn.TOO_LATE_TAG, main="on_time"
+            )
+        )
+
+        def _check_capped_lag(results):
+            results = list(results)
+            assert len(results) == 1, f"se esperaba exactamente 1 evento descartado, hubo {len(results)}"
+            reason = results[0]["reason"]
+            reported_lag = int(reason.split("atraso=")[1].split("s")[0])
+            assert reported_lag == max_future_skew, (
+                "el maximo deberia haber quedado acotado a "
+                f"+{max_future_skew}s, no al salto completo del evento anomalo "
+                f"(atraso reportado={reported_lag}s)"
+            )
+
+        assert_that(gated[TooLateGateFn.TOO_LATE_TAG], _check_capped_lag)
+
+
+def test_state_expires_after_ttl_of_inactivity_and_the_next_event_starts_fresh():
+    """Sin timer de expiracion, el estado de 'maximo visto' de una tarjeta
+    vive para siempre mientras dure el job de streaming -- una entrada por
+    cada tarjeta distinta vista alguna vez, sin limite. Con el timer (mismo
+    patron que DeduplicateByEventId en dedup.py), tras `ttl_seconds` de
+    inactividad de la tarjeta el estado se limpia, y el siguiente evento
+    arranca de cero en vez de compararse contra un maximo antiguo."""
+    ttl = TooLateGateFn().ttl_seconds
+    test_stream = (
+        TestStream()
+        .advance_watermark_to(0)
+        .add_elements([TimestampedValue(_event(), 1000)])
+        .advance_watermark_to(1000 + ttl + 10)
+        .add_elements([TimestampedValue(_event(), 0)])  # muy atras del maximo viejo, pero ya expiro
+        .advance_watermark_to_infinity()
+    )
+
+    with TestPipeline() as p:
+        gated = (
+            p
+            | test_stream
+            | "KeyByCardForGate" >> beam.Map(lambda e: (e["key"], e))
+            | "TooLateGate" >> beam.ParDo(TooLateGateFn()).with_outputs(
+                TooLateGateFn.TOO_LATE_TAG, main="on_time"
+            )
+        )
+        assert_that(gated[TooLateGateFn.TOO_LATE_TAG], equal_to([]), label="nothing_dropped_after_expiry")

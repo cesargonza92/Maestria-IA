@@ -25,44 +25,52 @@ Flujo (ver docs/arquitectura.md):
      evaluacion de reglas.
   8. Publicacion de fraud.alerts (clave estable = upsert / idempotencia).
 
-Runner por defecto: DirectRunner. Se declara semantica de entrega
-"at-least-once" con deduplicacion acotada e idempotencia en la salida por
-clave estable; no se afirma exactly-once end-to-end.
+Runner: **Flink** por defecto (`--runner=flink`), streaming real (sin cota de
+tiempo de lectura). Tambien se soporta **DirectRunner** (`--runner=direct`)
+para pruebas rapidas locales sin levantar el cluster de Flink -- ese modo
+corre como micro-lotes acotados (`--max-read-time-seconds`), un workaround
+necesario solo para el DirectRunner (ver mas abajo). Se declara semantica de
+entrega "at-least-once" con deduplicacion acotada e idempotencia en la salida
+por clave estable; no se afirma exactly-once end-to-end.
 
-Modelo de ejecucion -- micro-lotes acotados, no un job de streaming
-indefinido: se verifico empiricamente en este entorno (Beam 2.61.0,
-DirectRunner, Python 3.11, Docker) que (a) dejar que cada transformacion
-KafkaIO arranque su propio expansion service (comportamiento por defecto) y
-(b) una lectura NO acotada (`--streaming`, sin `max_read_time`) hacen que el
-pipeline se cuelgue indefinidamente sin entregar ningun dato al lado Python,
-incluso sin ningun DoFn propio de por medio. Usando una unica instancia de
-expansion service compartida (ver `io_kafka.py`) y una lectura ACOTADA
-(`max_read_time`) se verifico al menos una corrida real completa de punta a
-punta contra Kafka (validos en transactions.processed, job terminado
-limpio). Estas mitigaciones REDUCEN pero no eliminan por completo la
-inestabilidad: en corridas posteriores con lotes mas grandes el pipeline
-volvio a quedarse sin avanzar en el mismo punto del arranque del worker, sin
-error visible. Es una limitacion especifica del DirectRunner de Python
-combinado con transformaciones cross-language, no del diseño del pipeline
-(un runner de produccion como Flink no la tiene). Por eso la garantia de
-correccion se sostiene en las pruebas por capas con TestPipeline/TestStream
-(aisladas de Kafka), y el recorrido con Kafka real se documenta como
-best-effort. Ver docs/documento_tecnico.md, seccion de limites, para el
-detalle completo.
+Por que Flink es el runner por defecto -- se verifico empiricamente en este
+entorno (Beam 2.61.0, DirectRunner, Python 3.11, Docker) que el DirectRunner
+combinado con KafkaIO cross-language se cuelga o queda inestable de forma
+intermitente (memoria, puertos efimeros de varias JVMs) sin entregar datos,
+incluso con una unica instancia de expansion service compartida y lectura
+acotada como mitigacion (ver `io_kafka.py`). Es una limitacion especifica de
+esa combinacion runner+cross-language, no del diseño del pipeline: con Flink
+como runner real (via `PortableRunner`, sometido al job server oficial de
+Beam) el pipeline corre como streaming genuino, sin el workaround de
+micro-lotes. Ver docs/documento_tecnico.md, seccion de limites, para el
+detalle completo (incluye la corrida que reprodujo el cuelgue del
+DirectRunner en vivo, motivo de esta migracion).
 """
 
 import argparse
 import json
 import logging
+import typing
 import uuid
+from pathlib import Path
 
 import apache_beam as beam
 from apache_beam.coders import FloatCoder
 from apache_beam.metrics import Metrics
 from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.transforms import trigger
-from apache_beam.transforms.userstate import ReadModifyWriteStateSpec
+from apache_beam.transforms.timeutil import TimeDomain
+from apache_beam.transforms.userstate import ReadModifyWriteStateSpec, TimerSpec, on_timer
 from apache_beam.transforms.window import FixedWindows, TimestampedValue
+from apache_beam.utils.timestamp import Duration
+
+# Tipo de salida explicito para los pasos "Encode*" que preceden a cada
+# WriteToKafka (transformacion cross-language en Java): sin esta pista, Beam
+# infiere un coder de Python (pickle) para la tupla de bytes en vez del
+# coder portable que el lado Java necesita para decodificar, y falla (o, en
+# el runner de Flink, queda atascado sin error visible) en el cruce
+# Python->Java -- verificado empiricamente (ver docs/documento_tecnico.md).
+KAFKA_RECORD_TYPE = typing.Tuple[bytes, bytes]
 
 from dedup import DeduplicateByEventId
 from io_kafka import read_topic, write_topic
@@ -100,26 +108,58 @@ class TooLateGateFn(beam.DoFn):
     `threshold_seconds` se envia a la salida lateral `too_late` en vez de
     seguir hacia la deduplicacion/ventana. Es deterministico y depende solo
     de los event_time de los datos, no del reloj de pared: se puede probar
-    con TestStream sin depender de peculiaridades del runner."""
+    con TestStream sin depender de peculiaridades del runner.
+
+    El "maximo visto" se acota de dos formas para no depender de que los
+    datos de entrada sean siempre bien comportados:
+
+    - `max_future_skew_seconds`: un solo evento no puede empujar el maximo
+      mas alla de ese margen de una sola vez. Sin este limite, un unico
+      event_time anomalo (error de reloj del cliente, dato malicioso) deja
+      el maximo corrompido para siempre, y CUALQUIER evento legitimo
+      posterior de esa tarjeta pareceria "demasiado atrasado" respecto de
+      ese valor corrupto -- un problema real dado que este pipeline procesa
+      justamente el tipo de dato adversarial que un sistema antifraude
+      deberia tolerar.
+    - `ttl_seconds`: sin actividad de la tarjeta durante ese lapso, el
+      estado se limpia via timer (mismo patron que `DeduplicateByEventId`
+      en dedup.py). Sin esto, el estado crece sin limite -- una entrada por
+      cada tarjeta distinta vista alguna vez -- durante toda la vida del
+      job de streaming."""
 
     TOO_LATE_TAG = "too_late"
     MAX_EVENT_TIME_SEEN = ReadModifyWriteStateSpec("max_event_time_seen", FloatCoder())
+    EXPIRE_TIMER = TimerSpec("expire", TimeDomain.WATERMARK)
 
-    def __init__(self, threshold_seconds: int = TOO_LATE_THRESHOLD_SECONDS):
+    DEFAULT_MAX_FUTURE_SKEW_SECONDS = 300
+    DEFAULT_TTL_SECONDS = 3600  # 1 hora de inactividad de la tarjeta
+
+    def __init__(
+        self,
+        threshold_seconds: int = TOO_LATE_THRESHOLD_SECONDS,
+        max_future_skew_seconds: int = DEFAULT_MAX_FUTURE_SKEW_SECONDS,
+        ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    ):
         self.threshold_seconds = threshold_seconds
+        self.max_future_skew_seconds = max_future_skew_seconds
+        self.ttl_seconds = ttl_seconds
 
     def process(
         self,
         element,
         timestamp=beam.DoFn.TimestampParam,
         max_seen=beam.DoFn.StateParam(MAX_EVENT_TIME_SEEN),
+        expire_timer=beam.DoFn.TimerParam(EXPIRE_TIMER),
     ):
         _, event = element
         ts = float(timestamp)
         current_max = max_seen.read()
-        if current_max is None or ts > current_max:
-            max_seen.write(ts)
+        if current_max is None:
             current_max = ts
+        elif ts > current_max:
+            current_max = min(ts, current_max + self.max_future_skew_seconds)
+        max_seen.write(current_max)
+        expire_timer.set(timestamp + Duration(seconds=self.ttl_seconds))
 
         lag = current_max - ts
         if lag > self.threshold_seconds:
@@ -137,6 +177,10 @@ class TooLateGateFn(beam.DoFn):
             )
         else:
             yield event
+
+    @on_timer(EXPIRE_TIMER)
+    def expire(self, max_seen=beam.DoFn.StateParam(MAX_EVENT_TIME_SEEN)):
+        max_seen.clear()
 
 
 class ParseAndValidateFn(beam.DoFn):
@@ -172,12 +216,16 @@ class AssignEventTimeFn(beam.DoFn):
 
 
 def build_pipeline(pipeline, args):
+    # La cota de lectura (max_read_time) es solo un workaround del
+    # DirectRunner; con Flink el pipeline lee de forma continua (streaming
+    # real), asi que se omite.
+    max_read_time_seconds = args.max_read_time_seconds if args.runner == "direct" else None
     raw = read_topic(
         pipeline,
         args.bootstrap_servers,
         args.input_topic,
         args.consumer_group,
-        max_read_time_seconds=args.max_read_time_seconds,
+        max_read_time_seconds=max_read_time_seconds,
     )
 
     parsed = raw | "ParseValidate" >> beam.ParDo(ParseAndValidateFn()).with_outputs(
@@ -206,7 +254,10 @@ def build_pipeline(pipeline, args):
 
     write_topic(
         deduped
-        | "EncodeProcessed" >> beam.Map(lambda e: (e["event_id"].encode("utf-8"), json.dumps(e).encode("utf-8"))),
+        | "EncodeProcessed"
+        >> beam.Map(lambda e: (e["event_id"].encode("utf-8"), json.dumps(e).encode("utf-8"))).with_output_types(
+            KAFKA_RECORD_TYPE
+        ),
         args.bootstrap_servers,
         args.processed_topic,
         "WriteProcessed",
@@ -222,7 +273,10 @@ def build_pipeline(pipeline, args):
 
     write_topic(
         alerts
-        | "EncodeAlerts" >> beam.Map(lambda a: (a["alert_id"].encode("utf-8"), json.dumps(a).encode("utf-8"))),
+        | "EncodeAlerts"
+        >> beam.Map(lambda a: (a["alert_id"].encode("utf-8"), json.dumps(a).encode("utf-8"))).with_output_types(
+            KAFKA_RECORD_TYPE
+        ),
         args.bootstrap_servers,
         args.alerts_topic,
         "WriteAlerts",
@@ -231,7 +285,10 @@ def build_pipeline(pipeline, args):
     combined_invalid = (invalid_events, too_late) | "FlattenInvalid" >> beam.Flatten()
     write_topic(
         combined_invalid
-        | "EncodeInvalid" >> beam.Map(lambda e: (str(uuid.uuid4()).encode("utf-8"), json.dumps(e).encode("utf-8"))),
+        | "EncodeInvalid"
+        >> beam.Map(lambda e: (str(uuid.uuid4()).encode("utf-8"), json.dumps(e).encode("utf-8"))).with_output_types(
+            KAFKA_RECORD_TYPE
+        ),
         args.bootstrap_servers,
         args.invalid_topic,
         "WriteInvalid",
@@ -247,10 +304,35 @@ def parse_args(argv=None):
     parser.add_argument("--invalid-topic", default="invalid.events")
     parser.add_argument("--consumer-group", default="beam-pipeline")
     parser.add_argument(
+        "--runner",
+        choices=["flink", "direct"],
+        default="flink",
+        help="'flink' (por defecto): streaming real via PortableRunner sobre un cluster Flink. "
+        "'direct': DirectRunner local en micro-lotes acotados, para pruebas rapidas sin Flink.",
+    )
+    parser.add_argument(
+        "--job-endpoint",
+        default="beam_flink_job_server:8099",
+        help="Endpoint del job server de Beam para Flink (solo --runner=flink).",
+    )
+    parser.add_argument(
+        "--environment-type",
+        default="DOCKER",
+        choices=["DOCKER", "PROCESS"],
+        help="Ambiente de ejecucion de los workers de Flink (solo --runner=flink). "
+        "DOCKER (por defecto): un contenedor efimero por worker, simetrico para Python y "
+        "para el entorno Java nativo de KafkaIO -- requiere --network=host entre el "
+        "TaskManager y esos contenedores, que Docker Desktop (Windows/Mac) no soporta "
+        "realmente; verificado empiricamente (ver limites en docs/documento_tecnico.md). "
+        "PROCESS: subproceso local en el propio TaskManager -- funciona para los DoFn de "
+        "Python (ver flink/taskmanager.Dockerfile) pero deja sin resolver el entorno Java "
+        "de KafkaIO, que seguiria requiriendo DOCKER; no se uso como default por eso.",
+    )
+    parser.add_argument(
         "--max-read-time-seconds",
         type=int,
         default=90,
-        help="Duracion del micro-lote de lectura (ver nota de modelo de ejecucion arriba).",
+        help="Duracion del micro-lote de lectura, solo aplica con --runner=direct.",
     )
     return parser.parse_known_args(argv)
 
@@ -258,12 +340,45 @@ def parse_args(argv=None):
 def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s beam %(levelname)s %(message)s")
     known_args, pipeline_args = parse_args(argv)
-    pipeline_args += ["--save_main_session"]
+
+    if known_args.runner == "flink":
+        pipeline_args += [
+            "--runner=PortableRunner",
+            f"--job_endpoint={known_args.job_endpoint}",
+            f"--environment_type={known_args.environment_type}",
+            f"--setup_file={Path(__file__).resolve().parent / 'setup.py'}",
+            "--streaming",
+            "--save_main_session",
+            # Requerido para que la lectura basada en SDF de KafkaIO
+            # (ReadSourceDescriptors) confirme progreso y emita datos en
+            # Flink: sin checkpointing periodico el operador queda "vivo"
+            # (CPU alto) pero nunca finaliza el primer elemento -- verificado
+            # empiricamente (0 registros de salida indefinidamente).
+            "--checkpointing_interval=10000",
+        ]
+        if known_args.environment_type == "PROCESS":
+            # El TaskManager (ver flink/taskmanager.Dockerfile) tiene copiado
+            # el runtime de Python+Beam de la imagen oficial del SDK; el
+            # binario /opt/apache/beam/boot arranca el worker como
+            # subproceso local, sin Docker-in-Docker ni networking especial.
+            # Se usa --environment_config (JSON) en vez de --environment_option:
+            # este ultimo dispara una validacion del job server que falla
+            # ("environment type 'null'") cuando el pipeline tiene mas de un
+            # environment (aca hay dos: el de KafkaIO via expansion service,
+            # y el propio de los DoFn en Python) -- verificado empiricamente.
+            pipeline_args.append('--environment_config={"command": "/opt/apache/beam/boot"}')
+        log.info(
+            "Iniciando pipeline de streaming sobre Flink (job_endpoint=%s, environment_type=%s)",
+            known_args.job_endpoint, known_args.environment_type,
+        )
+    else:
+        pipeline_args += ["--save_main_session"]
+        log.info("Iniciando micro-lote (%ss) con DirectRunner", known_args.max_read_time_seconds)
+
     options = PipelineOptions(pipeline_args)
-    log.info("Iniciando micro-lote (%ss) con args=%s", known_args.max_read_time_seconds, vars(known_args))
     with beam.Pipeline(options=options) as pipeline:
         build_pipeline(pipeline, known_args)
-    log.info("Micro-lote completo.")
+    log.info("Pipeline finalizado.")
 
 
 if __name__ == "__main__":

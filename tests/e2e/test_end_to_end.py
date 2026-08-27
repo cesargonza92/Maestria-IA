@@ -23,6 +23,7 @@ from kafka.errors import NoBrokersAvailable
 
 BOOTSTRAP_SERVERS = "localhost:29092"
 RAW_TOPIC = "transactions.raw"
+PROCESSED_TOPIC = "transactions.processed"
 ALERTS_TOPIC = "fraud.alerts"
 INVALID_TOPIC = "invalid.events"
 POLL_TIMEOUT_SECONDS = 90
@@ -133,3 +134,64 @@ def test_normal_duplicate_late_and_invalid_events_flow_end_to_end():
     # (6 normales + 1 tardio dentro de la politica) entraron a la ventana.
     assert all(a["transaction_count"] <= 7 for a in card_alerts)
     assert invalid_seen, "se esperaba al menos un evento en invalid.events"
+
+
+def test_writes_to_all_three_output_topics_succeed_without_a_coder_exception():
+    """Regresion dirigida y rapida (no espera el cierre de ventana de
+    ~60-90s que necesita fraud.alerts): un evento invalido escribe a
+    invalid.events y uno valido (sin disparar ninguna regla) escribe a
+    transactions.processed. Los tres topicos de salida comparten el mismo
+    patron Encode*->WriteToKafka (transformacion cross-language en Java);
+    que dos de los tres no lancen una excepcion de coder da confianza
+    suficiente sobre el tercero. Existe porque un bug real de coder
+    (Encode* sin with_output_types explicito, ver pipeline.py) rompio en
+    silencio el cruce Python->Java en este punto: en el runner de Flink
+    el job quedaba "vivo" (CPU alto) sin emitir ningun dato, sin fallar
+    nunca de forma visible."""
+    card = f"card-e2e-{uuid.uuid4().hex[:8]}"
+    start = datetime.now(timezone.utc)
+
+    producer = KafkaProducer(
+        bootstrap_servers=BOOTSTRAP_SERVERS,
+        key_serializer=lambda k: k.encode("utf-8"),
+        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        acks="all",
+    )
+    producer.send(RAW_TOPIC, key=card, value=_event(card, start))
+    invalid_payload = {
+        "schema_version": "1.0",
+        "key": card,
+        "event_time": _iso(start),
+        "customer_id": "cust-e2e",
+        "merchant_id": "merch-e2e",
+        "amount": -1,
+        "currency": "PYG",
+        "country": "PY",
+        "channel": "POS",
+        "status": "APPROVED",
+    }  # invalido: falta event_id, monto negativo
+    producer.send(RAW_TOPIC, key=card, value=invalid_payload)
+    producer.flush()
+
+    consumer = KafkaConsumer(
+        PROCESSED_TOPIC,
+        INVALID_TOPIC,
+        bootstrap_servers=BOOTSTRAP_SERVERS,
+        auto_offset_reset="earliest",
+        group_id=f"e2e-smoke-{uuid.uuid4().hex[:8]}",
+        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+        consumer_timeout_ms=5000,
+    )
+
+    seen_processed = False
+    seen_invalid = False
+    deadline = time.time() + 30
+    while time.time() < deadline and not (seen_processed and seen_invalid):
+        for message in consumer:
+            if message.topic == PROCESSED_TOPIC and message.value.get("key") == card:
+                seen_processed = True
+            elif message.topic == INVALID_TOPIC:
+                seen_invalid = True
+
+    assert seen_processed, "el evento valido no llego a transactions.processed dentro del timeout"
+    assert seen_invalid, "el evento invalido no llego a invalid.events dentro del timeout"

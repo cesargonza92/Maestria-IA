@@ -47,8 +47,9 @@
     },
     "amount": {
       "type": "integer",
-      "description": "Monto en la unidad minima de la moneda (ej: PYG sin decimales).",
-      "minimum": 0
+      "description": "Monto en la unidad minima de la moneda (ej: PYG sin decimales). El tope superior es una validacion de sanidad basica (una transaccion real por encima de esto es indicio de dato corrupto o malicioso, no de una cifra bancaria real), no un limite de negocio.",
+      "minimum": 0,
+      "maximum": 1000000000
     },
     "currency": {
       "type": "string",

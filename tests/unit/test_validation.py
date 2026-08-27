@@ -56,6 +56,15 @@ def test_negative_amount_is_rejected():
     assert ok is False
 
 
+def test_absurdly_large_amount_is_rejected():
+    """Un monto por encima del tope de sanidad es indicio de dato corrupto
+    o malicioso, no una cifra bancaria real -- ver validation.py."""
+    event = dict(VALID_EVENT, amount=10_000_000_000)
+    ok, _, reason = validate(_raw(event))
+    assert ok is False
+    assert "contrato_invalido" in reason
+
+
 def test_unsupported_schema_version_is_rejected():
     event = dict(VALID_EVENT, schema_version="2.0")
     ok, _, reason = validate(_raw(event))
