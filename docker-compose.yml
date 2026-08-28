@@ -19,12 +19,16 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1"]
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"
+        ]
       interval: 5s
       timeout: 5s
-      retries: 30
+      retries: 20
       start_period: 10s
 
   kafka-init:
@@ -34,13 +38,12 @@ services:
       kafka:
         condition: service_healthy
     entrypoint: ["/bin/bash", "-c"]
-    command: >
-      "
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions.raw --partitions 3 --replication-factor 1 &&
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions.processed --partitions 3 --replication-factor 1 &&
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic fraud.alerts --partitions 3 --replication-factor 1 --config cleanup.policy=compact &&
+    command: |
+      set -e
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions.raw --partitions 3 --replication-factor 1
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions.processed --partitions 3 --replication-factor 1
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic fraud.alerts --partitions 3 --replication-factor 1 --config cleanup.policy=compact
       /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic invalid.events --partitions 3 --replication-factor 1
-      "
 
   jobmanager:
     image: flink:1.17-scala_2.12-java11
@@ -55,11 +58,15 @@ services:
         rest.bind-address: 0.0.0.0
         jobmanager.memory.process.size: 1024m
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O- http://localhost:8081/overview >/dev/null 2>&1"]
-      interval: 10s
-      timeout: 10s
-      retries: 20
-      start_period: 20s
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://localhost:8081/overview >/dev/null 2>&1"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
 
   taskmanager:
     build:
@@ -78,36 +85,34 @@ services:
         taskmanager.host: localhost
         taskmanager.numberOfTaskSlots: 2
 
-        taskmanager.memory.process.size: 2048m
-        taskmanager.memory.jvm-metaspace.size: 512m
-        taskmanager.memory.framework.off-heap.size: 256m
-        taskmanager.memory.task.off-heap.size: 256m
+        # 2 GB resultaron insuficientes durante los checkpoints
+        # (java.lang.OutOfMemoryError: Java heap space).
+        taskmanager.memory.process.size: 4096m
 
+        # Mantener por compatibilidad con Beam/gRPC durante cierres/redeploy.
         classloader.check-leaked-classloader: false
 
-        restart-strategy: fixed-delay
+        # Reintentos acotados.
+        restart-strategy.type: fixed-delay
         restart-strategy.fixed-delay.attempts: 5
         restart-strategy.fixed-delay.delay: 10 s
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - beam_artifact_staging:/tmp/beam-artifact-staging
 
-  beam_flink_job_server:
+  beam-flink-job-server:
     image: apache/beam_flink1.17_job_server:2.61.0
     container_name: beam-flink-job-server
     network_mode: host
-    command:
-      - "--job-host=localhost"
-      - "--flink-master=localhost:8081"
-      - "--job-port=8099"
-      - "--artifact-port=8098"
-      - "--expansion-port=8097"
-      - "--artifacts-dir=/tmp/beam-artifact-staging"
     depends_on:
       jobmanager:
         condition: service_healthy
-      taskmanager:
-        condition: service_started
+    command:
+      - "--flink-master=localhost:8081"
+      - "--job-host=0.0.0.0"
+      - "--job-port=8099"
+      - "--artifact-port=8098"
+      - "--expansion-port=8097"
     volumes:
       - beam_artifact_staging:/tmp/beam-artifact-staging
 
@@ -124,18 +129,20 @@ services:
         condition: service_completed_successfully
       jobmanager:
         condition: service_healthy
+      beam-flink-job-server:
+        condition: service_started
       taskmanager:
         condition: service_started
-      beam_flink_job_server:
-        condition: service_started
     environment:
-      PYTHONUNBUFFERED: "1"
-    command:
-      - "--bootstrap-servers=localhost:29092"
-      - "--runner=flink"
-      - "--job-endpoint=localhost:8099"
-    volumes:
-      - beam_expansion_cache:/root/.apache_beam
+      KAFKA_BOOTSTRAP_SERVERS: localhost:29092
+      KAFKA_INPUT_TOPIC: transactions.raw
+      KAFKA_PROCESSED_TOPIC: transactions.processed
+      KAFKA_ALERTS_TOPIC: fraud.alerts
+      KAFKA_INVALID_TOPIC: invalid.events
+      KAFKA_GROUP_ID: beam-pipeline
+      BEAM_RUNNER: flink
+      FLINK_MASTER: localhost:8081
+      FLINK_JOB_ENDPOINT: localhost:8099
     restart: unless-stopped
 
   producer:
@@ -144,15 +151,13 @@ services:
       dockerfile: producer/Dockerfile
     profiles: ["tools"]
     depends_on:
+      kafka:
+        condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
     environment:
-      PYTHONUNBUFFERED: "1"
-    command:
-      - "--bootstrap-servers=kafka:9092"
-      - "--profiles=normal,duplicates,late,alerting"
-      - "--count=30"
-      - "--seed=42"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: transactions.raw
 
   consumer:
     build:
@@ -160,14 +165,15 @@ services:
       dockerfile: consumer/Dockerfile
     profiles: ["tools"]
     depends_on:
+      kafka:
+        condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
     environment:
-      PYTHONUNBUFFERED: "1"
-    command:
-      - "--bootstrap-servers=kafka:9092"
-      - "--timeout-ms=25000"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_PROCESSED_TOPIC: transactions.processed
+      KAFKA_ALERTS_TOPIC: fraud.alerts
+      KAFKA_INVALID_TOPIC: invalid.events
 
 volumes:
-  beam_expansion_cache:
   beam_artifact_staging:
