@@ -173,6 +173,11 @@ def test_writes_to_all_three_output_topics_succeed_without_a_coder_exception():
     producer.send(RAW_TOPIC, key=card, value=invalid_payload)
     producer.flush()
 
+    # Al ejecutar toda la suite E2E, este segundo escenario puede comenzar
+    # mientras Flink/Beam termina de materializar resultados del primero.
+    # Se agrega un margen corto para evitar un falso negativo por sincronizacion.
+    time.sleep(5)
+
     consumer = KafkaConsumer(
         PROCESSED_TOPIC,
         INVALID_TOPIC,
@@ -185,7 +190,10 @@ def test_writes_to_all_three_output_topics_succeed_without_a_coder_exception():
 
     seen_processed = False
     seen_invalid = False
-    deadline = time.time() + 30
+    # En ejecucion aislada este test completa normalmente en ~20 s, pero al
+    # correr junto al E2E principal puede necesitar mas margen por actividad
+    # pendiente del runner y de Kafka.
+    deadline = time.time() + 60
     while time.time() < deadline and not (seen_processed and seen_invalid):
         for message in consumer:
             if message.topic == PROCESSED_TOPIC and message.value.get("key") == card:

@@ -9,26 +9,24 @@ services:
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      CLUSTER_ID: "ZGF0YS1zdHJlYW1pbmctcHJveWVjdG8"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
-      interval: 10s
-      timeout: 10s
-      retries: 20
-      start_period: 20s
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
 
-  # Crea los 4 topicos del contrato (seccion 4 del documento tecnico) y
-  # termina. El resto de los servicios esperan a que este complete con exito,
-  # de forma que "docker compose up" sea reproducible sin pasos manuales.
   kafka-init:
     image: apache/kafka:3.7.0
     container_name: kafka-init
@@ -40,23 +38,10 @@ services:
       "
       /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions.raw --partitions 3 --replication-factor 1 &&
       /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions.processed --partitions 3 --replication-factor 1 &&
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic fraud.alerts --partitions 1 --replication-factor 1 --config cleanup.policy=compact &&
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic invalid.events --partitions 1 --replication-factor 1 &&
-      echo 'Topicos creados:' &&
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic fraud.alerts --partitions 3 --replication-factor 1 --config cleanup.policy=compact &&
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic invalid.events --partitions 3 --replication-factor 1
       "
 
-  # Cluster de Flink (runner de produccion del pipeline, ver beam_pipeline
-  # mas abajo). jobmanager y taskmanager corren con network_mode: host: el
-  # TaskManager lanza cada worker del SDK harness como un contenedor
-  # "hermano" tambien en red host, y necesita compartir el MISMO namespace
-  # de red que el propio TaskManager para poder reconectarse por
-  # "localhost" -- si el TaskManager estuviera en la red puente normal de
-  # Compose, ese "localhost" nunca apuntaria al lugar correcto (verificado
-  # empiricamente; ver docs/documento_tecnico.md, seccion de limites, para
-  # el detalle de por que se llego a esta configuracion). Esto requiere
-  # Docker con soporte real de red tipo host (Linux nativo / WSL2 con
-  # Docker Engine -- no funciona sobre Docker Desktop for Windows/Mac).
   jobmanager:
     image: flink:1.17-scala_2.12-java11
     container_name: flink-jobmanager
@@ -65,6 +50,9 @@ services:
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: localhost
+        jobmanager.bind-host: 0.0.0.0
+        rest.address: 0.0.0.0
+        rest.bind-address: 0.0.0.0
         jobmanager.memory.process.size: 1024m
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O- http://localhost:8081/overview >/dev/null 2>&1"]
@@ -80,10 +68,6 @@ services:
     container_name: flink-taskmanager
     command: taskmanager
     network_mode: host
-    # el usuario "flink" (no root) de la imagen oficial no tiene permiso
-    # sobre /var/run/docker.sock montado del host; se necesita root (y el
-    # wrapper de entrypoint) para que el proceso que lanza los contenedores
-    # del SDK harness (environment_type=DOCKER) pueda usar ese socket.
     user: root
     depends_on:
       jobmanager:
@@ -92,42 +76,23 @@ services:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: localhost
         taskmanager.host: localhost
+        taskmanager.bind-host: 0.0.0.0
         taskmanager.numberOfTaskSlots: 2
         taskmanager.memory.process.size: 2048m
         taskmanager.memory.jvm-metaspace.size: 512m
         taskmanager.memory.framework.off-heap.size: 256m
         taskmanager.memory.task.off-heap.size: 256m
     volumes:
-      # necesario para que el taskmanager lance los contenedores efimeros
-      # del SDK harness (Python y Java) como "hermanos" -- monta el socket
-      # de Docker del host.
       - /var/run/docker.sock:/var/run/docker.sock
-      # compartido con beam_flink_job_server: el job server guarda ahi los
-      # artefactos (paquete Python, dependencias) al recibir el job
-      # sometido, y el taskmanager necesita leerlos desde el MISMO lugar
-      # para servirselos a cada worker -- si no se comparte, falla con
-      # FileNotFoundException (verificado empiricamente).
       - beam_artifact_staging:/tmp/beam-artifact-staging
 
-  # Job server oficial de Beam para Flink: recibe el pipeline sometido por
-  # beam_pipeline (PortableRunner) y lo traduce/despacha al cluster de Flink.
-  # Se mantiene en la red puente normal de Compose (no necesita compartir
-  # namespace con los workers); para llegar a jobmanager (que ahora esta en
-  # red host, sin nombre DNS de Compose) usa host.docker.internal, resuelto
-  # via extra_hosts al gateway del host.
   beam_flink_job_server:
     image: apache/beam_flink1.17_job_server:2.61.0
     container_name: beam-flink-job-server
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    network_mode: host
     command:
-      # --job-host: el job server anuncia por defecto "localhost" como su
-      # propio host en las respuestas de preparacion de job (endpoints de
-      # artifact staging/control); eso rompe la conexion cuando quien somete
-      # el job es OTRO contenedor. Hay que anunciar el nombre de servicio de
-      # Compose para que sea resoluble desde beam_pipeline.
-      - "--job-host=beam_flink_job_server"
-      - "--flink-master=host.docker.internal:8081"
+      - "--job-host=localhost"
+      - "--flink-master=localhost:8081"
       - "--job-port=8099"
       - "--artifact-port=8098"
       - "--expansion-port=8097"
@@ -135,12 +100,9 @@ services:
     depends_on:
       jobmanager:
         condition: service_healthy
-    ports:
-      - "8097:8097"
-      - "8098:8098"
-      - "8099:8099"
+      taskmanager:
+        condition: service_started
     volumes:
-      # ver comentario en taskmanager: directorio de artefactos compartido.
       - beam_artifact_staging:/tmp/beam-artifact-staging
 
   beam_pipeline:
@@ -148,29 +110,28 @@ services:
       context: .
       dockerfile: beam_pipeline/Dockerfile
     container_name: beam_pipeline
+    network_mode: host
     depends_on:
+      kafka:
+        condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
-      beam_flink_job_server:
-        condition: service_started
+      jobmanager:
+        condition: service_healthy
       taskmanager:
+        condition: service_started
+      beam_flink_job_server:
         condition: service_started
     environment:
       PYTHONUNBUFFERED: "1"
-    # bootstrap-servers = localhost:29092 (no "kafka:9092"): este valor se
-    # usa en tiempo de EJECUCION por el cluster de Flink (jobmanager/
-    # taskmanager en red host), no por este contenedor -- ver comentario en
-    # jobmanager/taskmanager mas arriba. localhost:29092 es el listener de
-    # Kafka publicado en el host, alcanzable desde procesos en red host.
-    command: ["--bootstrap-servers=localhost:29092", "--runner=flink", "--job-endpoint=beam_flink_job_server:8099"]
+    command:
+      - "--bootstrap-servers=localhost:29092"
+      - "--runner=flink"
+      - "--job-endpoint=localhost:8099"
     volumes:
-      # cachea el jar del expansion service de KafkaIO entre reinicios del
-      # contenedor; solo se descarga de Maven Central la primera vez.
       - beam_expansion_cache:/root/.apache_beam
     restart: unless-stopped
 
-  # producer y consumer no se levantan con "docker compose up": se invocan
-  # puntualmente (ver README / scripts/demo) con --profile tools run --rm.
   producer:
     build:
       context: .
@@ -181,7 +142,11 @@ services:
         condition: service_completed_successfully
     environment:
       PYTHONUNBUFFERED: "1"
-    command: ["--bootstrap-servers=kafka:9092", "--profiles=normal,duplicates,late,alerting", "--count=30", "--seed=42"]
+    command:
+      - "--bootstrap-servers=kafka:9092"
+      - "--profiles=normal,duplicates,late,alerting"
+      - "--count=30"
+      - "--seed=42"
 
   consumer:
     build:
@@ -193,7 +158,9 @@ services:
         condition: service_completed_successfully
     environment:
       PYTHONUNBUFFERED: "1"
-    command: ["--bootstrap-servers=kafka:9092", "--timeout-ms=25000"]
+    command:
+      - "--bootstrap-servers=kafka:9092"
+      - "--timeout-ms=25000"
 
 volumes:
   beam_expansion_cache:

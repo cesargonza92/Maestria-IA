@@ -35,8 +35,8 @@ pipeline (incluida la expansión de KafkaIO) y lo somete al job server oficial d
 (`environment_type=DOCKER`). También se soporta **DirectRunner** (`--runner=direct`) como modo liviano para
 pruebas rápidas sin levantar el cluster completo. **Estado verificado de esta arquitectura**: streaming real de
 punta a punta contra Flink, con datos fluyendo continuamente por las cuatro etapas hasta `fraud.alerts` (ver
-sección 6 para el recorrido completo de diagnóstico: requiere Docker con soporte real de red tipo host — Linux
-nativo o WSL2 con Docker Engine, no Docker Desktop — y corrige un bug de coder en el cruce Python↔Java que
+sección 6 para el recorrido completo de diagnóstico: requiere red host y fue validada en
+Windows + WSL2 + Docker Desktop; y corrige un bug de coder en el cruce Python↔Java que
 también se documenta ahí).
 
 ## 3. Contrato de eventos, tópicos, claves y particiones
@@ -216,14 +216,13 @@ escenarios reales de falla, con qué garantiza el diseño ante cada uno y qué n
   3. **CLI de Docker faltante**: la imagen oficial de Flink no trae el CLI de `docker`, necesario para que el
      TaskManager lance los workers del SDK harness como contenedores — corregido copiándolo desde la imagen
      oficial de Docker (`flink/taskmanager.Dockerfile`).
-  4. **Red de tipo host real, requerida por Docker Desktop**: el TaskManager lanza cada worker del SDK harness
-     (tanto para los `DoFn` de Python como para el entorno Java nativo de KafkaIO) como un contenedor "hermano"
-     con `--network=host`, para poder reconectarse al TaskManager por `localhost`. Esto solo funciona si el
-     **TaskManager mismo** también está en red host (comparte el mismo namespace de red que sus hijos) — y
-     **Docker Desktop para Windows/Mac no implementa una red de tipo host real**, a diferencia de Docker
-     nativo en Linux. Se resolvió corriendo el entorno sobre **Docker Engine nativo dentro de una distro WSL2
-     dedicada** (`wsl --install`, sin Docker Desktop), con `jobmanager` y `taskmanager` en `network_mode: host`
-     y las direcciones de `FLINK_PROPERTIES` ajustadas a `localhost`.
+  4. **Alineación de red host entre Flink, Beam y los SDK Harness**: el TaskManager lanza los workers del SDK
+     harness como contenedores hermanos con `--network=host`, por lo que los componentes críticos de Beam/Flink
+     se configuraron también con `network_mode: host` y endpoints `localhost`. En el entorno de entrega se
+     verificó explícitamente esta configuración con **Windows + WSL2 + Docker Desktop**: Flink respondió en
+     `127.0.0.1:8081`, el Beam Job Server en `127.0.0.1:8099`, los SDK Harness establecieron sus canales y Kafka
+     quedó accesible para Beam/Flink mediante `localhost:29092`.
+
   5. **Almacenamiento de artefactos compartido**: el job server y el TaskManager son contenedores separados,
      cada uno con su propio `/tmp/beam-artifact-staging` local — sin compartirlo, el TaskManager no encuentra
      los artefactos (paquete Python, dependencias) que el job server dejó ahí al recibir el job

@@ -13,10 +13,9 @@ diagrama en [`docs/arquitectura.md`](docs/arquitectura.md).
 
 ## Prerrequisitos
 
-- Docker y Docker Compose v2 (`docker compose version`), con soporte real de red tipo host: Linux nativo, o
-  **WSL2 con Docker Engine nativo instalado dentro de la distro** (no Docker Desktop — ver "Corrida con Flink
-  en Windows" más abajo). Docker Desktop para Windows/Mac no implementa host networking real y el runner de
-  Flink no completa el recorrido en vivo sobre él; `--runner=direct` sí funciona igual en cualquier entorno.
+- Docker y Docker Compose v2 (`docker compose version`). La configuración final usa `network_mode: host`
+  para los componentes Beam/Flink. En el entorno validado del proyecto, **Windows + WSL2 + Docker Desktop**
+  soportó correctamente esta configuración; se verificó la conectividad host antes de ejecutar el pipeline.
 - Acceso a internet en el primer arranque: Beam descarga el *expansion service* de KafkaIO desde Maven Central
   (se cachea en un volumen), y Docker descarga las imágenes de Flink y del job server de Beam (~1.5GB).
 - Para correr los tests localmente sin Docker: Python 3.11 y `pip install -r requirements.txt`.
@@ -83,7 +82,48 @@ Smoke test end-to-end (requiere el entorno levantado, ver "Inicio"):
 
 ```bash
 pip install -r requirements.txt
-pytest tests/e2e -v
+python -m pytest tests/e2e -v
+```
+## Validación final
+
+La versión final del proyecto fue validada ejecutando el flujo completo de streaming sobre Apache Flink, Apache Beam y Kafka.
+
+### Entorno validado
+
+- **Sistema operativo:** Windows con WSL2.
+- **Contenedores:** Docker Desktop + Docker Compose v2.
+- **Python:** 3.11.9.
+- **Apache Beam:** 2.61.0.
+- **Apache Flink:** 1.17.
+- **Apache Kafka:** 3.7.0.
+- **Runner principal:** Flink mediante Apache Beam `PortableRunner`.
+- **Entorno de los SDK Harness:** `DOCKER`.
+
+La arquitectura final utiliza `network_mode: host` para los componentes de ejecución de Beam/Flink. En el entorno utilizado para la entrega se verificó correctamente la comunicación entre:
+
+- `beam_pipeline`
+- `beam_flink_job_server`
+- Flink `jobmanager`
+- Flink `taskmanager`
+- SDK Harness de Python
+- SDK Harness de Java
+- Kafka
+
+Los principales endpoints utilizados durante la validación fueron:
+
+| Componente | Endpoint |
+|---|---|
+| Kafka desde Beam/Flink | `localhost:29092` |
+| Flink JobManager / Dashboard | `localhost:8081` |
+| Beam Flink Job Server | `localhost:8099` |
+
+### Pruebas ejecutadas
+
+Se validaron las pruebas unitarias, las pruebas de comportamiento temporal mediante `TestStream` y las pruebas end-to-end contra la infraestructura real.
+
+```powershell
+python -m pytest tests/unit tests/streaming -v
+python -m pytest tests/e2e -v
 ```
 
 ## Demostración
@@ -142,17 +182,16 @@ docker compose logs -f beam_pipeline
 
 ### Corrida con Flink en Windows
 
-Docker Desktop no soporta host networking real, que el runner de Flink necesita (ver Prerrequisitos). Para
-reproducir la corrida de Flink en Windows: instalar una distro WSL2 dedicada con Docker Engine nativo (**no**
-Docker Desktop) —
+La configuración final fue validada en **Windows + WSL2 + Docker Desktop**. `jobmanager`, `taskmanager`,
+`beam_flink_job_server` y `beam_pipeline` usan `network_mode: host`; los SDK Harness efímeros lanzados por el
+TaskManager también usan red host. Esto permite que los endpoints internos de Beam/Flink se resuelvan mediante
+`localhost`.
 
-```powershell
-wsl --install -d Ubuntu-24.04
-```
+Con el entorno levantado, Flink debe responder en `http://localhost:8081`, el Beam Flink Job Server en
+`localhost:8099` y Kafka queda accesible para Beam/Flink en `localhost:29092`.
 
-— y dentro de esa distro instalar Docker Engine siguiendo la [guía oficial para Ubuntu](https://docs.docker.com/engine/install/ubuntu/),
-clonar/montar este repo (accesible en `/mnt/c/...`) y correr los comandos de este README desde ahí. `--runner=direct`
-no tiene esta limitación y corre igual sobre Docker Desktop.
+> Esta validación corresponde al entorno usado para la entrega. En otro host o versión de Docker conviene
+> verificar explícitamente el soporte de `--network host`.
 
 ## Detener el entorno
 
@@ -173,13 +212,12 @@ de Java. Para limpiarlo también: `docker compose down -v`.)
   eventos (ver `producer/profiles.py`), para poder repetir un escenario en la demo o en el smoke test.
 - `kafka-init` crea los 4 tópicos automáticamente al levantar el entorno; no hay pasos manuales.
 - Runner de Beam: **Flink** por defecto (streaming real, `PortableRunner`, verificado de punta a punta), con
-  **DirectRunner** disponible como alternativa liviana (`--runner=direct`). Flink requiere Docker con soporte
-  real de red tipo host — ver "Prerrequisitos" y "Corrida con Flink en Windows" arriba, y la sección de
-  límites del documento técnico para el diagnóstico completo del camino hasta el estado actual.
+  **DirectRunner** disponible como alternativa liviana (`--runner=direct`). La configuración Flink usa red host
+  y fue validada en Windows + WSL2 + Docker Desktop; ver "Corrida con Flink en Windows" y el documento técnico.
 
 ## Integrantes y contribuciones
 
 | Integrante | Contribución principal |
 |---|---|
 | Graciela Lezcano ([@graclez](https://github.com/graclez)) | Diseño e implementación completa: contrato de eventos, productor sintético, pipeline de Beam (validación, gate de tardanza, deduplicación, ventanas, reglas), consumidor de demostración, infraestructura Docker, pruebas (unitarias, `TestStream`, e2e) y documentación. |
-| César Gonzalez ([@cesargonza92](https://github.com/cesargonza92)) | *(completar!!)* |
+| César Gonzalez ([@cesargonza92](https://github.com/cesargonza92)) | Integración y validación de la arquitectura end-to-end Kafka + Apache Beam + Flink; configuración y estabilización del entorno Docker/WSL2; diagnóstico de conectividad entre Job Server, JobManager, TaskManager y SDK Harness; ajuste y ejecución de pruebas E2E; validación del flujo de eventos y tópicos Kafka; documentación técnica, pruebas de reproducibilidad y preparación de la versión final entregable. |

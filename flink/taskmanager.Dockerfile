@@ -1,15 +1,21 @@
-# Imagen del TaskManager de Flink + el CLI de Docker.
+# Imagen del TaskManager de Flink + Docker CLI.
 #
-# El runner portable de Beam, con environment_type=DOCKER, hace que el
-# TaskManager ejecute el binario `docker` (via el socket montado) para
-# levantar un contenedor efimero por worker del SDK harness (tanto para los
-# DoFn de Python como para el entorno Java nativo de KafkaIO). La imagen
-# oficial de Flink no trae ese binario -- se copia el CLI estatico desde la
-# imagen oficial de Docker (no se necesita el daemon, solo el CLI).
+# Beam PortableRunner con environment_type=DOCKER necesita que el
+# TaskManager pueda invocar Docker mediante /var/run/docker.sock.
+
 FROM docker:26-cli AS dockercli
 
 FROM flink:1.17-scala_2.12-java11
+
+USER root
+
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
+
 COPY flink/taskmanager-entrypoint.sh /taskmanager-entrypoint.sh
-RUN chmod +x /taskmanager-entrypoint.sh
+
+# Windows puede guardar .sh como CRLF.
+# Se normaliza a LF antes de utilizarlo como ENTRYPOINT.
+RUN sed -i 's/\r$//' /taskmanager-entrypoint.sh \
+    && chmod +x /taskmanager-entrypoint.sh
+
 ENTRYPOINT ["/taskmanager-entrypoint.sh"]
