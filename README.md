@@ -62,8 +62,19 @@ Verificar que los tópicos se crearon:
 docker compose logs kafka-init --no-log-prefix
 ```
 
-Verificar el cluster de Flink: abrir **http://localhost:8081** — debería verse 1 TaskManager registrado. El
-estado del job sometido se ve ahí mismo, o con:
+Verificar primero el estado del cluster de Flink mediante la API REST del JobManager:
+
+```bash
+docker exec flink-jobmanager curl -s http://localhost:8081/overview
+```
+
+La respuesta debe mostrar al menos un TaskManager registrado y slots disponibles o asignados. El estado de los jobs puede consultarse con:
+
+```bash
+docker exec flink-jobmanager curl -s http://localhost:8081/jobs/overview
+```
+
+El dashboard web en **http://localhost:8081** puede utilizarse cuando el endpoint REST esté accesible desde el host. La validación del cluster no depende exclusivamente del acceso al dashboard. Los logs del pipeline también pueden consultarse con:
 
 ```bash
 docker compose logs -f beam_pipeline
@@ -114,7 +125,7 @@ Los principales endpoints utilizados durante la validación fueron:
 | Componente | Endpoint |
 |---|---|
 | Kafka desde Beam/Flink | `localhost:29092` |
-| Flink JobManager / Dashboard | `localhost:8081` |
+| Flink JobManager / REST | `localhost:8081` (interno; acceso desde host dependiente del entorno) |
 | Beam Flink Job Server | `localhost:8099` |
 
 ### Pruebas ejecutadas
@@ -187,11 +198,38 @@ La configuración final fue validada en **Windows + WSL2 + Docker Desktop**. `jo
 TaskManager también usan red host. Esto permite que los endpoints internos de Beam/Flink se resuelvan mediante
 `localhost`.
 
-Con el entorno levantado, Flink debe responder en `http://localhost:8081`, el Beam Flink Job Server en
+Con el entorno levantado, la API REST de Flink se verifica desde el JobManager con
+`docker exec flink-jobmanager curl -s http://localhost:8081/overview`. El acceso directo al dashboard desde
+Windows puede depender de la exposición de red de Docker Desktop. El Beam Flink Job Server utiliza
 `localhost:8099` y Kafka queda accesible para Beam/Flink en `localhost:29092`.
 
 > Esta validación corresponde al entorno usado para la entrega. En otro host o versión de Docker conviene
 > verificar explícitamente el soporte de `--network host`.
+
+## Estabilización del TaskManager
+
+Durante ejecuciones prolongadas se observó una finalización del TaskManager con código de salida `239`, sin indicios de terminación por falta de memoria (`OOMKilled=false`). Los logs mostraron accesos tardíos a un classloader ya cerrado en la interacción Flink + Beam/gRPC/Log4j.
+
+La configuración actual incorpora:
+
+```yaml
+classloader.check-leaked-classloader: false
+restart-strategy: fixed-delay
+restart-strategy.fixed-delay.attempts: 5
+restart-strategy.fixed-delay.delay: 10 s
+```
+
+La política limita los redeploys indefinidos y evita que la comprobación de classloaders de Flink termine el TaskManager por accesos tardíos de componentes de terceros. Esta configuración se considera un ajuste de estabilización del entorno local; las ejecuciones prolongadas deben seguir verificándose operacionalmente.
+
+Para comprobar el estado:
+
+```powershell
+docker compose ps
+docker exec flink-jobmanager curl -s http://localhost:8081/overview
+docker exec flink-jobmanager curl -s http://localhost:8081/jobs/overview
+```
+
+Si `taskmanagers` es `0`, se debe revisar `docker compose logs taskmanager` antes de continuar con la demostración.
 
 ## Detener el entorno
 
@@ -211,6 +249,7 @@ de Java. Para limpiarlo también: `docker compose down -v`.)
 - El productor es determinista: mismo `--seed` + mismo `--profiles` generan siempre la misma secuencia de
   eventos (ver `producer/profiles.py`), para poder repetir un escenario en la demo o en el smoke test.
 - `kafka-init` crea los 4 tópicos automáticamente al levantar el entorno; no hay pasos manuales.
+- Los cuatro tópicos (`transactions.raw`, `transactions.processed`, `fraud.alerts` e `invalid.events`) se crean con **3 particiones** y factor de replicación **1**; `fraud.alerts` utiliza `cleanup.policy=compact`.
 - Runner de Beam: **Flink** por defecto (streaming real, `PortableRunner`, verificado de punta a punta), con
   **DirectRunner** disponible como alternativa liviana (`--runner=direct`). La configuración Flink usa red host
   y fue validada en Windows + WSL2 + Docker Desktop; ver "Corrida con Flink en Windows" y el documento técnico.

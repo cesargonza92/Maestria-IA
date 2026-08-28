@@ -76,12 +76,18 @@ services:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: localhost
         taskmanager.host: localhost
-        taskmanager.bind-host: 0.0.0.0
         taskmanager.numberOfTaskSlots: 2
+
         taskmanager.memory.process.size: 2048m
         taskmanager.memory.jvm-metaspace.size: 512m
         taskmanager.memory.framework.off-heap.size: 256m
         taskmanager.memory.task.off-heap.size: 256m
+
+        classloader.check-leaked-classloader: false
+
+        restart-strategy: fixed-delay
+        restart-strategy.fixed-delay.attempts: 5
+        restart-strategy.fixed-delay.delay: 10 s
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - beam_artifact_staging:/tmp/beam-artifact-staging
