@@ -47,6 +47,7 @@ detalle completo (incluye la corrida que reprodujo el cuelgue del
 DirectRunner en vivo, motivo de esta migracion).
 """
 
+import os
 import argparse
 import json
 import logging
@@ -297,7 +298,11 @@ def build_pipeline(pipeline, args):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--bootstrap-servers", default="kafka:9092")
+    #parser.add_argument("--bootstrap-servers", default="kafka:9092")
+    parser.add_argument(
+        "--bootstrap-servers",
+        default=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:29092"),
+    )
     parser.add_argument("--input-topic", default="transactions.raw")
     parser.add_argument("--processed-topic", default="transactions.processed")
     parser.add_argument("--alerts-topic", default="fraud.alerts")
@@ -312,7 +317,10 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--job-endpoint",
-        default="beam_flink_job_server:8099",
+        default=os.getenv(
+            "FLINK_JOB_ENDPOINT",
+            os.getenv("BEAM_JOB_ENDPOINT", "localhost:8099"),
+        ),
         help="Endpoint del job server de Beam para Flink (solo --runner=flink).",
     )
     parser.add_argument(

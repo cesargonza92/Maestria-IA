@@ -37,13 +37,46 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    entrypoint: ["/bin/bash", "-c"]
-    command: |
-      set -e
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions.raw --partitions 3 --replication-factor 1
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions.processed --partitions 3 --replication-factor 1
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic fraud.alerts --partitions 3 --replication-factor 1 --config cleanup.policy=compact
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic invalid.events --partitions 3 --replication-factor 1
+    entrypoint: ["/bin/bash"]
+    command:
+      - "-c"
+      - |
+        set -e
+
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:9092 \
+          --create \
+          --if-not-exists \
+          --topic transactions.raw \
+          --partitions 3 \
+          --replication-factor 1
+
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:9092 \
+          --create \
+          --if-not-exists \
+          --topic transactions.processed \
+          --partitions 3 \
+          --replication-factor 1
+
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:9092 \
+          --create \
+          --if-not-exists \
+          --topic fraud.alerts \
+          --partitions 3 \
+          --replication-factor 1 \
+          --config cleanup.policy=compact
+
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:9092 \
+          --create \
+          --if-not-exists \
+          --topic invalid.events \
+          --partitions 3 \
+          --replication-factor 1
+
+        echo "Kafka topics initialized."
 
   jobmanager:
     image: flink:1.17-scala_2.12-java11
@@ -85,9 +118,14 @@ services:
         taskmanager.host: localhost
         taskmanager.numberOfTaskSlots: 2
 
-        # 2 GB resultaron insuficientes durante los checkpoints
-        # (java.lang.OutOfMemoryError: Java heap space).
+        # Memoria total del proceso TaskManager.
         taskmanager.memory.process.size: 4096m
+
+        # Beam Fn API / gRPC utiliza memoria directa (off-heap).
+        # Reservamos explícitamente memoria para evitar:
+        # java.lang.OutOfMemoryError: Direct buffer memory
+        taskmanager.memory.framework.off-heap.size: 512m
+        taskmanager.memory.task.off-heap.size: 512m
 
         # Mantener por compatibilidad con Beam/gRPC durante cierres/redeploy.
         classloader.check-leaked-classloader: false

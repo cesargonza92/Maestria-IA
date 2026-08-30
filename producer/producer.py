@@ -9,6 +9,7 @@ Uso:
     python producer.py --profiles normal,duplicates,late,alerting --count 40 --seed 7
 """
 
+import os
 import argparse
 import json
 import logging
@@ -67,7 +68,11 @@ def run(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bootstrap-servers", default="localhost:9092")
+    #parser.add_argument("--bootstrap-servers", default="localhost:9092")
+    parser.add_argument(
+        "--bootstrap-servers",
+        default=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"),
+    )
     parser.add_argument("--topic", default="transactions.raw")
     parser.add_argument("--profiles", default="normal", help="Lista separada por comas: normal,duplicates,late,alerting")
     parser.add_argument("--count", type=int, default=30, help="Eventos por perfil")

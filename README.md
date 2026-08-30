@@ -1,262 +1,429 @@
-# Proyecto Integrador — Data Streaming (Kafka + Apache Beam)
+# Proyecto Integrador --- Data Streaming (Kafka + Apache Beam + Apache Flink)
 
-**Maestría en Inteligencia Artificial — FPUNA**
-Materia: *Streaming de datos y sus aplicaciones* · Docente: Rodrigo Parra, M.Sc.
+**Maestría en Inteligencia Artificial --- FPUNA**\
+Materia: *Streaming de datos y sus aplicaciones* · Docente: Rodrigo
+Parra, M.Sc.\
 Integrantes: **Graciela Lezcano** · **César Gonzalez**
 
+## Descripción
 
-Detección de patrones sospechosos en transacciones de pago **sintéticas** (frecuencia, monto acumulado,
-multi-país, multi-comercio), con un pipeline end-to-end: **productor → Kafka → Apache Beam → Kafka →
-consumidor**. La propuesta completa está en [`docs/documento_tecnico.md`](docs/documento_tecnico.md) (caso de
-uso, contrato de eventos, tópicos, ventanas, deduplicación, semántica de entrega y límites conocidos) y el
-diagrama en [`docs/arquitectura.md`](docs/arquitectura.md).
+Detección de patrones sospechosos en transacciones de pago
+**sintéticas** (frecuencia, monto acumulado, multi-país y
+multi-comercio), mediante un pipeline de streaming end-to-end:
+
+**productor → Kafka → Apache Beam → Apache Flink → Kafka → consumidor**
+
+Apache Beam implementa la lógica de procesamiento y Apache Flink actúa
+como runner distribuido mediante `PortableRunner`.
+
+La documentación técnica completa se encuentra en
+[`docs/documento_tecnico.md`](docs/documento_tecnico.md) y el diagrama
+de arquitectura en [`docs/arquitectura.md`](docs/arquitectura.md).
 
 ## Prerrequisitos
 
-- Docker y Docker Compose v2 (`docker compose version`). La configuración final usa `network_mode: host`
-  para los componentes Beam/Flink. En el entorno validado del proyecto, **Windows + WSL2 + Docker Desktop**
-  soportó correctamente esta configuración; se verificó la conectividad host antes de ejecutar el pipeline.
-- Acceso a internet en el primer arranque: Beam descarga el *expansion service* de KafkaIO desde Maven Central
-  (se cachea en un volumen), y Docker descarga las imágenes de Flink y del job server de Beam (~1.5GB).
-- Para correr los tests localmente sin Docker: Python 3.11 y `pip install -r requirements.txt`.
+-   Docker y Docker Compose v2.
+-   Windows + WSL2 + Docker Desktop para el entorno validado.
+-   Soporte de `network_mode: host` para Beam/Flink.
+-   Acceso a Internet durante el primer arranque.
+-   Python 3.11 para ejecutar las pruebas localmente.
+-   `pip install -r requirements.txt`.
+
+> Entorno validado: Python 3.11.9, Apache Beam 2.61.0, Apache Flink 1.17
+> y Apache Kafka 3.7.0.
 
 ## Estructura del repositorio
 
-```
+``` text
 contracts/        Contrato de eventos (JSON Schema)
-producer/          Productor sintético (perfiles: normal, duplicates, late, alerting)
-beam_pipeline/      Pipeline de Apache Beam (validación, dedup, ventanas, reglas, KafkaIO)
-flink/              Imagen del TaskManager de Flink (runtime para el runner de streaming)
-consumer/           Consumidor de demostración
-tests/unit/         Pruebas unitarias (validación, reglas, dedup)
-tests/streaming/    Pruebas de ventanas/tiempo de evento con TestStream
-tests/e2e/          Smoke test end-to-end contra el entorno real
-data/               Escenario de ejemplo (no sensible)
-docs/               Documento técnico y diagrama de arquitectura
-scripts/            Comandos de inicio, demo, detención y análisis de distribución de claves
+producer/         Productor sintético
+beam_pipeline/    Pipeline Apache Beam
+flink/            Configuración e imagen del TaskManager de Flink
+consumer/         Consumidor de demostración
+tests/unit/       Pruebas unitarias
+tests/streaming/  Pruebas de ventanas y tiempo de evento
+tests/e2e/        Pruebas end-to-end
+data/             Escenarios de ejemplo
+docs/             Documento técnico y arquitectura
+scripts/          Scripts de inicio, demo y detención
 ```
 
-## Inicio
+## Arquitectura de ejecución
 
-```bash
+El pipeline utiliza Apache Beam con `PortableRunner` sobre Apache Flink.
+Los componentes Beam/Flink y los SDK Harness de Python y Java creados
+dinámicamente utilizan red host.
+
+Kafka mantiene dos listeners:
+
+  -----------------------------------------------------------------------
+  Cliente                             Bootstrap server
+  ----------------------------------- -----------------------------------
+  `producer`, `consumer` y            `kafka:9092`
+  `kafka-init` dentro de Docker       
+  Compose                             
+
+  Beam/Flink y SDK Harness con red    `localhost:29092`
+  host                                
+  -----------------------------------------------------------------------
+
+Endpoints principales:
+
+  Componente                      Endpoint
+  ------------------------------- -------------------
+  Kafka desde Beam/Flink          `localhost:29092`
+  Kafka desde servicios Compose   `kafka:9092`
+  Flink JobManager / REST         `localhost:8081`
+  Beam Flink Job Server           `localhost:8099`
+
+### Variables de entorno
+
+Para el pipeline Beam:
+
+``` text
+KAFKA_BOOTSTRAP_SERVERS=localhost:29092
+FLINK_JOB_ENDPOINT=localhost:8099
+KAFKA_GROUP_ID=beam-pipeline
+```
+
+Para productor y consumidor:
+
+``` text
+KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+```
+
+Los valores definidos mediante variables de entorno tienen prioridad
+sobre los valores por defecto de los scripts Python.
+
+## Tópicos Kafka
+
+  Tópico                       Particiones Uso
+  -------------------------- ------------- ----------------------------------
+  `transactions.raw`                     3 Eventos de entrada
+  `transactions.processed`               3 Transacciones válidas procesadas
+  `fraud.alerts`                         3 Alertas generadas por las reglas
+  `invalid.events`                       3 Eventos inválidos o rechazados
+
+El factor de replicación utilizado localmente es **1** y `fraud.alerts`
+utiliza `cleanup.policy=compact`.
+
+## Inicio del entorno
+
+``` powershell
 docker compose up -d --build
 ```
 
-Esto levanta Kafka, crea los tópicos, levanta el cluster de Flink (`jobmanager` + `taskmanager`) y el job
-server de Beam, y somete el pipeline (`beam_pipeline`). El primer arranque tarda varios minutos (descarga las
-imágenes de Flink y del job server, ~1.5GB en total). O usando el script equivalente:
+Verificar los contenedores:
 
-```bash
-scripts/start.sh
+``` powershell
+docker compose ps
 ```
 
-En Windows/PowerShell:
+Verificar los tópicos:
 
-```powershell
-scripts\start.ps1
-```
-
-Verificar que los tópicos se crearon:
-
-```bash
+``` powershell
 docker compose logs kafka-init --no-log-prefix
 ```
 
-Verificar primero el estado del cluster de Flink mediante la API REST del JobManager:
+Verificar Flink:
 
-```bash
+``` powershell
 docker exec flink-jobmanager curl -s http://localhost:8081/overview
-```
-
-La respuesta debe mostrar al menos un TaskManager registrado y slots disponibles o asignados. El estado de los jobs puede consultarse con:
-
-```bash
 docker exec flink-jobmanager curl -s http://localhost:8081/jobs/overview
 ```
 
-El dashboard web en **http://localhost:8081** puede utilizarse cuando el endpoint REST esté accesible desde el host. La validación del cluster no depende exclusivamente del acceso al dashboard. Los logs del pipeline también pueden consultarse con:
+En una ejecución correcta el job debe encontrarse en estado `RUNNING`,
+sin tareas fallidas.
 
-```bash
+Logs del pipeline:
+
+``` powershell
 docker compose logs -f beam_pipeline
-```
-
-## Pruebas
-
-Unitarias y de ventanas/tiempo de evento (no requieren Docker ni Kafka):
-
-```bash
-pip install -r requirements.txt
-pytest tests/unit tests/streaming -v
-```
-
-Smoke test end-to-end (requiere el entorno levantado, ver "Inicio"):
-
-```bash
-pip install -r requirements.txt
-python -m pytest tests/e2e -v
-```
-## Validación final
-
-La versión final del proyecto fue validada ejecutando el flujo completo de streaming sobre Apache Flink, Apache Beam y Kafka.
-
-### Entorno validado
-
-- **Sistema operativo:** Windows con WSL2.
-- **Contenedores:** Docker Desktop + Docker Compose v2.
-- **Python:** 3.11.9.
-- **Apache Beam:** 2.61.0.
-- **Apache Flink:** 1.17.
-- **Apache Kafka:** 3.7.0.
-- **Runner principal:** Flink mediante Apache Beam `PortableRunner`.
-- **Entorno de los SDK Harness:** `DOCKER`.
-
-La arquitectura final utiliza `network_mode: host` para los componentes de ejecución de Beam/Flink. En el entorno utilizado para la entrega se verificó correctamente la comunicación entre:
-
-- `beam_pipeline`
-- `beam_flink_job_server`
-- Flink `jobmanager`
-- Flink `taskmanager`
-- SDK Harness de Python
-- SDK Harness de Java
-- Kafka
-
-Los principales endpoints utilizados durante la validación fueron:
-
-| Componente | Endpoint |
-|---|---|
-| Kafka desde Beam/Flink | `localhost:29092` |
-| Flink JobManager / REST | `localhost:8081` (interno; acceso desde host dependiente del entorno) |
-| Beam Flink Job Server | `localhost:8099` |
-
-### Pruebas ejecutadas
-
-Se validaron las pruebas unitarias, las pruebas de comportamiento temporal mediante `TestStream` y las pruebas end-to-end contra la infraestructura real.
-
-```powershell
-python -m pytest tests/unit tests/streaming -v
-python -m pytest tests/e2e -v
 ```
 
 ## Demostración
 
-Publica un lote con los 4 perfiles (normal, duplicados, tardíos/desordenados y uno que dispara las 4 reglas
-deliberadamente) y muestra el resultado materializado:
+La demostración principal puede ejecutarse mediante:
 
-```bash
-scripts/demo.sh
-```
-
-```powershell
+``` powershell
 scripts\demo.ps1
 ```
 
-Esto ejecuta, en orden:
+También puede realizarse manualmente.
 
-1. `producer` (perfil `normal,duplicates,late,alerting`, seed fijo — reproducible).
-2. Una espera para que el pipeline (streaming real sobre Flink) procese y publique los resultados.
-3. `consumer`, que imprime cada alerta nueva/actualizada y un resumen final (alertas distintas materializadas
-   por `alert_id`, eventos inválidos/descartados recibidos).
+### 1. Verificar el job de Flink
 
-Para correr manualmente con otros parámetros:
-
-```bash
-docker compose --profile tools run --rm producer --bootstrap-servers=kafka:9092 --profiles=late --count=20 --seed=7
-docker compose --profile tools run --rm consumer --bootstrap-servers=kafka:9092 --timeout-ms=20000
+``` powershell
+docker exec flink-jobmanager curl -s http://localhost:8081/jobs/overview
 ```
 
-Para verificar cómo se distribuyeron las tarjetas producidas entre las particiones de `transactions.raw`
-(mensajes, tarjetas distintas y orden por partición — ver `docs/documento_tecnico.md`, sección 3):
+### 2. Generar eventos
 
-```bash
-pip install -r requirements.txt
-python scripts/analyze_partition_skew.py --bootstrap-servers=localhost:29092
+``` powershell
+docker compose --profile tools run --rm producer `
+  --bootstrap-servers=kafka:9092 `
+  --profiles=normal,duplicates,late,alerting `
+  --count=10 `
+  --seed=7
 ```
 
-Para correr el pipeline con DirectRunner en vez de Flink (más simple, sin cluster; funciona en cualquier
-entorno, incluido Docker Desktop):
+### 3. Verificar entrada
 
-```bash
-docker compose run --rm beam_pipeline --bootstrap-servers=kafka:9092 --runner=direct --max-read-time-seconds=90 --consumer-group=demo-direct
+``` powershell
+docker exec kafka `
+  /opt/kafka/bin/kafka-get-offsets.sh `
+  --bootstrap-server kafka:9092 `
+  --topic transactions.raw
 ```
 
-> Si vas a tener corriendo Flink y una corrida manual de DirectRunner al mismo tiempo contra el mismo Kafka,
-> usá un `--consumer-group` distinto en cada una (como en el ejemplo) — comparten el mismo valor por defecto
-> (`beam-pipeline`), y dos corridas con el mismo grupo se reparten las particiones entre sí en vez de leer cada
-> una el flujo completo.
+### 4. Mostrar eventos procesados
 
-Logs del pipeline en vivo (eventos válidos/inválidos, duplicados descartados, eventos fuera de política,
-alertas emitidas):
-
-```bash
-docker compose logs -f beam_pipeline
+``` powershell
+docker exec kafka `
+  /opt/kafka/bin/kafka-console-consumer.sh `
+  --bootstrap-server kafka:9092 `
+  --topic transactions.processed `
+  --from-beginning `
+  --max-messages 5 `
+  --timeout-ms 10000
 ```
 
-### Corrida con Flink en Windows
+### 5. Mostrar alertas
 
-La configuración final fue validada en **Windows + WSL2 + Docker Desktop**. `jobmanager`, `taskmanager`,
-`beam_flink_job_server` y `beam_pipeline` usan `network_mode: host`; los SDK Harness efímeros lanzados por el
-TaskManager también usan red host. Esto permite que los endpoints internos de Beam/Flink se resuelvan mediante
-`localhost`.
+``` powershell
+docker exec kafka `
+  /opt/kafka/bin/kafka-console-consumer.sh `
+  --bootstrap-server kafka:9092 `
+  --topic fraud.alerts `
+  --from-beginning `
+  --max-messages 5 `
+  --timeout-ms 10000
+```
 
-Con el entorno levantado, la API REST de Flink se verifica desde el JobManager con
-`docker exec flink-jobmanager curl -s http://localhost:8081/overview`. El acceso directo al dashboard desde
-Windows puede depender de la exposición de red de Docker Desktop. El Beam Flink Job Server utiliza
-`localhost:8099` y Kafka queda accesible para Beam/Flink en `localhost:29092`.
+### 6. Mostrar eventos inválidos
 
-> Esta validación corresponde al entorno usado para la entrega. En otro host o versión de Docker conviene
-> verificar explícitamente el soporte de `--network host`.
+``` powershell
+docker exec kafka `
+  /opt/kafka/bin/kafka-console-consumer.sh `
+  --bootstrap-server kafka:9092 `
+  --topic invalid.events `
+  --from-beginning `
+  --max-messages 5 `
+  --timeout-ms 10000
+```
+
+## Pruebas
+
+### Unitarias y comportamiento temporal
+
+``` powershell
+python -m pytest tests/unit tests/streaming -v
+```
+
+### End-to-end
+
+Con la infraestructura levantada:
+
+``` powershell
+pytest .\tests\e2e\test_end_to_end.py -v -s
+```
+
+Resultado validado para la versión final:
+
+``` text
+tests/e2e/test_end_to_end.py::test_normal_duplicate_late_and_invalid_events_flow_end_to_end PASSED
+tests/e2e/test_end_to_end.py::test_writes_to_all_three_output_topics_succeed_without_a_coder_exception PASSED
+
+2 passed in 92.10s
+```
+
+La primera prueba verifica eventos normales, duplicados, tardíos e
+inválidos. La segunda verifica la escritura hacia los tres tópicos de
+salida y actúa como regresión frente a errores de codificación en la
+frontera Beam Python/KafkaIO.
+
+## Validación funcional final
+
+Se publicó un lote de **30 transacciones sintéticas** con el perfil
+`normal`.
+
+Entrada:
+
+``` text
+transactions.raw:0:0
+transactions.raw:1:17
+transactions.raw:2:13
+```
+
+Total: **30 eventos**.
+
+Salida procesada:
+
+``` text
+transactions.processed:0:13
+transactions.processed:1:11
+transactions.processed:2:6
+```
+
+Total: **30 eventos procesados**.
+
+Alertas:
+
+``` text
+fraud.alerts:0:4
+fraud.alerts:1:4
+fraud.alerts:2:3
+```
+
+Total: **11 alertas**.
+
+Eventos inválidos para esta corrida:
+
+``` text
+invalid.events:0:0
+invalid.events:1:0
+invalid.events:2:0
+```
+
+El JobManager informó:
+
+``` text
+state = RUNNING
+running = 6
+total = 6
+initializing = 0
+failed = 0
+```
+
+El recorrido validado fue:
+
+``` text
+Producer
+   |
+   v
+transactions.raw
+   |
+   v
+Apache Beam
+   |
+   v
+Apache Flink
+   |
+   +--> transactions.processed
+   +--> fraud.alerts
+   +--> invalid.events
+```
 
 ## Estabilización del TaskManager
 
-Durante ejecuciones prolongadas se observó una finalización del TaskManager con código de salida `239`, sin indicios de terminación por falta de memoria (`OOMKilled=false`). Los logs mostraron accesos tardíos a un classloader ya cerrado en la interacción Flink + Beam/gRPC/Log4j.
+Durante la integración se identificaron problemas de memoria
+directa/off-heap en el TaskManager:
 
-La configuración actual incorpora:
+``` text
+java.lang.OutOfMemoryError: Direct buffer memory
+```
 
-```yaml
+La configuración final reserva explícitamente memoria:
+
+``` yaml
+taskmanager.memory.process.size: 4096m
+taskmanager.memory.framework.off-heap.size: 512m
+taskmanager.memory.task.off-heap.size: 512m
+
 classloader.check-leaked-classloader: false
-restart-strategy: fixed-delay
+
+restart-strategy.type: fixed-delay
 restart-strategy.fixed-delay.attempts: 5
 restart-strategy.fixed-delay.delay: 10 s
 ```
 
-La política limita los redeploys indefinidos y evita que la comprobación de classloaders de Flink termine el TaskManager por accesos tardíos de componentes de terceros. Esta configuración se considera un ajuste de estabilización del entorno local; las ejecuciones prolongadas deben seguir verificándose operacionalmente.
+Esta configuración permitió estabilizar la integración Flink + Beam +
+gRPC/Netty.
 
-Para comprobar el estado:
+Para revisar el estado:
 
-```powershell
+``` powershell
 docker compose ps
 docker exec flink-jobmanager curl -s http://localhost:8081/overview
 docker exec flink-jobmanager curl -s http://localhost:8081/jobs/overview
 ```
 
-Si `taskmanagers` es `0`, se debe revisar `docker compose logs taskmanager` antes de continuar con la demostración.
+Ante una caída del TaskManager:
+
+``` powershell
+docker compose logs --tail 200 taskmanager
+```
+
+## DirectRunner
+
+Flink es el runner principal. DirectRunner se mantiene como alternativa
+para pruebas locales:
+
+``` powershell
+docker compose run --rm beam_pipeline `
+  --bootstrap-servers=kafka:9092 `
+  --runner=direct `
+  --max-read-time-seconds=90 `
+  --consumer-group=demo-direct
+```
+
+Si Flink y DirectRunner se ejecutan simultáneamente deben utilizar
+grupos de consumidores diferentes.
 
 ## Detener el entorno
 
-```bash
+``` powershell
 docker compose down
 ```
 
-```powershell
+o:
+
+``` powershell
 scripts\stop.ps1
 ```
 
-(El volumen `beam_expansion_cache` se conserva entre corridas para no volver a descargar el expansion service
-de Java. Para limpiarlo también: `docker compose down -v`.)
+Para eliminar también los volúmenes:
+
+``` powershell
+docker compose down -v
+```
 
 ## Notas de reproducibilidad
 
-- El productor es determinista: mismo `--seed` + mismo `--profiles` generan siempre la misma secuencia de
-  eventos (ver `producer/profiles.py`), para poder repetir un escenario en la demo o en el smoke test.
-- `kafka-init` crea los 4 tópicos automáticamente al levantar el entorno; no hay pasos manuales.
-- Los cuatro tópicos (`transactions.raw`, `transactions.processed`, `fraud.alerts` e `invalid.events`) se crean con **3 particiones** y factor de replicación **1**; `fraud.alerts` utiliza `cleanup.policy=compact`.
-- Runner de Beam: **Flink** por defecto (streaming real, `PortableRunner`, verificado de punta a punta), con
-  **DirectRunner** disponible como alternativa liviana (`--runner=direct`). La configuración Flink usa red host
-  y fue validada en Windows + WSL2 + Docker Desktop; ver "Corrida con Flink en Windows" y el documento técnico.
+-   El productor permite utilizar un `seed` fijo para repetir
+    escenarios.
+-   `kafka-init` crea automáticamente los cuatro tópicos.
+-   Los cuatro tópicos utilizan 3 particiones y factor de replicación 1.
+-   Flink es el runner principal del proyecto.
+-   La solución fue validada end-to-end sobre Windows + WSL2 + Docker
+    Desktop.
+-   El pipeline utiliza claves estables para permitir materialización
+    idempotente de alertas.
 
 ## Integrantes y contribuciones
 
-| Integrante | Contribución principal |
-|---|---|
-| Graciela Lezcano ([@graclez](https://github.com/graclez)) | Diseño e implementación completa: contrato de eventos, productor sintético, pipeline de Beam (validación, gate de tardanza, deduplicación, ventanas, reglas), consumidor de demostración, infraestructura Docker, pruebas (unitarias, `TestStream`, e2e) y documentación. |
-| César Gonzalez ([@cesargonza92](https://github.com/cesargonza92)) | Integración y validación de la arquitectura end-to-end Kafka + Apache Beam + Flink; configuración y estabilización del entorno Docker/WSL2; diagnóstico de conectividad entre Job Server, JobManager, TaskManager y SDK Harness; ajuste y ejecución de pruebas E2E; validación del flujo de eventos y tópicos Kafka; documentación técnica, pruebas de reproducibilidad y preparación de la versión final entregable. |
+  ----------------------------------------------------------------------------------------
+  Integrante                                           Contribución principal
+  ---------------------------------------------------- -----------------------------------
+  Graciela Lezcano                                     Diseño e implementación del
+  ([@graclez](https://github.com/graclez))             contrato de eventos, productor
+                                                       sintético, lógica del pipeline de
+                                                       Apache Beam (validación, tardanza,
+                                                       deduplicación, ventanas y reglas),
+                                                       consumidor de demostración y
+                                                       pruebas funcionales.
+
+  César Gonzalez                                       Integración y validación de la
+  ([@cesargonza92](https://github.com/cesargonza92))   arquitectura end-to-end Kafka +
+                                                       Apache Beam + Flink; configuración
+                                                       y estabilización del entorno
+                                                       Docker/WSL2; diagnóstico de
+                                                       conectividad entre Job Server,
+                                                       JobManager, TaskManager y SDK
+                                                       Harness; ajuste y ejecución de
+                                                       pruebas E2E; validación del flujo
+                                                       de eventos y tópicos Kafka;
+                                                       documentación técnica, pruebas de
+                                                       reproducibilidad y preparación de
+                                                       la versión final entregable.
+  ----------------------------------------------------------------------------------------
