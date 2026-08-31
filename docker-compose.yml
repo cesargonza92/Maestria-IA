@@ -78,8 +78,26 @@ services:
 
         echo "Kafka topics initialized."
 
+  flink-checkpoints-init:
+    image: alpine:3.20
+    container_name: flink-checkpoints-init
+    command:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /flink-checkpoints/checkpoints
+        mkdir -p /flink-checkpoints/savepoints
+        chmod -R 777 /flink-checkpoints
+        echo "Flink checkpoint storage initialized."
+    volumes:
+      - flink_checkpoints:/flink-checkpoints
+    restart: "no"
+
   jobmanager:
     image: flink:1.17-scala_2.12-java11
+    depends_on:
+      flink-checkpoints-init:
+        condition: service_completed_successfully
     container_name: flink-jobmanager
     command: jobmanager
     network_mode: host
@@ -90,6 +108,11 @@ services:
         rest.address: 0.0.0.0
         rest.bind-address: 0.0.0.0
         jobmanager.memory.process.size: 1024m
+
+        # Checkpoints persistentes en filesystem compartido.
+        execution.checkpointing.storage: filesystem
+        state.checkpoints.dir: file:///flink-checkpoints/checkpoints
+        state.savepoints.dir: file:///flink-checkpoints/savepoints
     healthcheck:
       test:
         [
@@ -100,6 +123,8 @@ services:
       timeout: 5s
       retries: 30
       start_period: 15s
+    volumes:
+      - flink_checkpoints:/flink-checkpoints
 
   taskmanager:
     build:
@@ -116,7 +141,7 @@ services:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: localhost
         taskmanager.host: localhost
-        taskmanager.numberOfTaskSlots: 2
+        taskmanager.numberOfTaskSlots: 4
 
         # Memoria total del proceso TaskManager.
         taskmanager.memory.process.size: 4096m
@@ -126,6 +151,11 @@ services:
         # java.lang.OutOfMemoryError: Direct buffer memory
         taskmanager.memory.framework.off-heap.size: 512m
         taskmanager.memory.task.off-heap.size: 512m
+
+        # Checkpoints persistentes en filesystem compartido.
+        execution.checkpointing.storage: filesystem
+        state.checkpoints.dir: file:///flink-checkpoints/checkpoints
+        state.savepoints.dir: file:///flink-checkpoints/savepoints
 
         # Mantener por compatibilidad con Beam/gRPC durante cierres/redeploy.
         classloader.check-leaked-classloader: false
@@ -137,6 +167,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - beam_artifact_staging:/tmp/beam-artifact-staging
+      - flink_checkpoints:/flink-checkpoints
 
   beam-flink-job-server:
     image: apache/beam_flink1.17_job_server:2.61.0
@@ -215,3 +246,4 @@ services:
 
 volumes:
   beam_artifact_staging:
+  flink_checkpoints:
